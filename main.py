@@ -1,5 +1,5 @@
-from modules.toDF import notion_results_to_df
-from modules.monthlyAggregate import get_or_create_monthly_summary_db, upsert_monthly_summary
+from modules.toDataFrame import notion_results_to_df
+from modules.updateDatabase import get_or_create_monthly_summary_db, upsert_monthly_summary
 from notion_client import Client
 import pandas as pd
 from dateutil import parser
