@@ -26,13 +26,14 @@ class Notion:
     - Create and update summary databases
     """
     
-    def __init__(self, notion_token=None):
+    def __init__(self, notion_token=None, aggregation_attribute=None):
         """
         Initialize the Notion client.
         
         Args:
             notion_token (str, optional): Notion API token. If not provided,
                                         will try to load from environment variables.
+            aggregation_attribute (str, optional): Attribute to aggregate. Must be a numeric property in the database.
         """
         if notion_token is None:
             load_dotenv()
@@ -45,6 +46,18 @@ class Notion:
         self.source_db_id = None
         self.target_db_id = None
         self.parent_page_id = None
+        self.aggregation_attribute = aggregation_attribute
+
+    def get_database_properties(self, database_id):
+        """
+        Fetch and return the properties of a Notion database.
+        Args:
+            database_id (str): Database ID
+        Returns:
+            dict: Properties of the database
+        """
+        db = self.client.databases.retrieve(database_id)
+        return db.get("properties", {})
     
     def set_database_ids(self, source_db_id, target_db_id=None, parent_page_id=None):
         """
@@ -89,35 +102,44 @@ class Notion:
         
         return results
     
-    def results_to_dataframe(self, results):
+    def results_to_dataframe(self, results, database_id=None):
         """
         Convert Notion API results to a pandas DataFrame.
         
         Args:
             results (list): List of Notion API results
-            
+            database_id (str, optional): Database ID to fetch schema for dynamic extraction
         Returns:
-            pd.DataFrame: DataFrame with Date, Year, Month, Day, and rnd columns
+            pd.DataFrame: DataFrame with all extracted columns
         """
         rows = []
-        
+        # Get property schema
+        prop_schema = self.get_database_properties(database_id or self.source_db_id)
+        # Identify date and numeric properties
+        date_keys = [k for k, v in prop_schema.items() if v["type"] == "date"]
+        number_keys = [k for k, v in prop_schema.items() if v["type"] == "number" or v["type"] == "formula"]
+        # Extract all properties
         for page in results:
             props = page.get("properties", {})
-            
-            # Extract Date and rnd values
-            date_value = props.get("Date", {}).get("date", {}).get("start")
-            rnd_value = props.get("rnd", {}).get("formula", {}).get("number")
-            
-            if date_value and rnd_value is not None:
-                date_parsed = parser.parse(date_value)
-                rows.append({
-                    "Date": date_parsed,
-                    "Year": date_parsed.year,
-                    "Month": date_parsed.strftime("%B"),
-                    "Day": date_parsed.strftime("%A"),
-                    "rnd": rnd_value
-                })
-        
+            row = {}
+            for key in date_keys:
+                date_val = props.get(key, {}).get("date", {}).get("start")
+                if date_val:
+                    date_parsed = parser.parse(date_val)
+                    row[key] = date_parsed
+                    row["Year"] = date_parsed.year
+                    row["Month"] = date_parsed.strftime("%B")
+                    row["Day"] = date_parsed.strftime("%A")
+            for key in number_keys:
+                # Support both formula and number
+                if props.get(key, {}).get("type") == "formula":
+                    val = props.get(key, {}).get("formula", {}).get("number")
+                else:
+                    val = props.get(key, {}).get("number")
+                if val is not None:
+                    row[key] = val
+            if row:
+                rows.append(row)
         return pd.DataFrame(rows)
     
     def get_daily_data(self, database_id=None):
@@ -131,7 +153,7 @@ class Notion:
             pd.DataFrame: Daily habit data
         """
         results = self.fetch_all_records(database_id)
-        return self.results_to_dataframe(results)
+        return self.results_to_dataframe(results, database_id)
     
     def aggregate_monthly_performance(self, df):
         """
@@ -143,18 +165,18 @@ class Notion:
         Returns:
             pd.DataFrame: Monthly aggregated data
         """
+        if not self.aggregation_attribute:
+            raise ValueError("aggregation_attribute must be set for aggregation.")
         # Step 1 — Aggregate
         monthly_avg = (
-            df.groupby(["Year", "Month"], as_index=False)["rnd"]
+            df.groupby(["Year", "Month"], as_index=False)[self.aggregation_attribute]
               .mean()
-              .rename(columns={"rnd": "avg_rnd"})
+              .rename(columns={self.aggregation_attribute: f"avg_{self.aggregation_attribute}"})
         )
-        
         # Step 2 — Add numeric month value for proper sorting
         monthly_avg["Month_Num"] = monthly_avg["Month"].apply(
             lambda m: list(calendar.month_name).index(m)
         )
-        
         # Step 3 — Sort by Year (desc), then Month (desc)
         monthly_avg = (
             monthly_avg
@@ -162,12 +184,45 @@ class Notion:
             .drop(columns="Month_Num")
             .reset_index(drop=True)
         )
-        
         # Step 4 — Round and return
-        monthly_avg["avg_rnd"] = monthly_avg["avg_rnd"].round(2)
-        
+        monthly_avg[f"avg_{self.aggregation_attribute}"] = monthly_avg[f"avg_{self.aggregation_attribute}"].round(2)
         return monthly_avg
     
+    def _get_summary_property_names(self):
+        """
+        Build dynamic property and column names based on the aggregation attribute.
+        Returns:
+            tuple[str, str]: (summary_property_name, avg_column_name)
+        """
+        if not self.aggregation_attribute:
+            raise ValueError("aggregation_attribute must be set for summary database operations.")
+        summary_prop = f"Average {self.aggregation_attribute}"
+        avg_col = f"avg_{self.aggregation_attribute}"
+        return summary_prop, avg_col
+
+    def _ensure_summary_db_properties(self, database_id):
+        """
+        Ensure the summary database has the required dynamic properties.
+        Creates/updates the numeric summary property if missing.
+        """
+        summary_prop, _ = self._get_summary_property_names()
+        db = self.client.databases.retrieve(database_id)
+        props = db.get("properties", {})
+
+        desired_updates = {}
+        # Ensure Name (title)
+        if "Name" not in props or props["Name"].get("type") != "title":
+            desired_updates["Name"] = {"title": {}}
+        # Ensure Date (date)
+        if "Date" not in props or props["Date"].get("type") != "date":
+            desired_updates["Date"] = {"date": {}}
+        # Ensure dynamic Average property (number)
+        if summary_prop not in props or props.get(summary_prop, {}).get("type") != "number":
+            desired_updates[summary_prop] = {"number": {"format": "number"}}
+
+        if desired_updates:
+            self.client.databases.update(database_id=database_id, properties=desired_updates)
+
     def get_or_create_monthly_summary_db(self, parent_page_id=None):
         """
         Get or create a monthly summary database.
@@ -194,16 +249,19 @@ class Notion:
                 db_title = block["child_database"]["title"].strip().lower()
                 if db_title == "monthly aggregate summary".lower():
                     print(f"✅ Found existing inline database: {db_title} ({block['id']})")
+                    # Ensure properties are present/updated on the found DB
+                    self._ensure_summary_db_properties(block["id"])
                     return block["id"]
         
         # Step 3 — If not found, create a new database
+        summary_prop, _ = self._get_summary_property_names()
         db = self.client.databases.create(
             parent={"type": "page_id", "page_id": parent_page_id},
             title=[{"type": "text", "text": {"content": "Monthly Aggregate Summary"}}],
             icon={"type": "emoji", "emoji": "🧮"},
             properties={
                 "Name": {"title": {}},
-                "Average rnd": {"number": {"format": "number"}},
+                summary_prop: {"number": {"format": "number"}},
                 "Date": {"date": {}},
             },
         )
@@ -239,9 +297,12 @@ class Notion:
                 existing_map[name_label] = page["id"]
         
         # Step 3 — Update or insert
+        summary_prop, avg_col = self._get_summary_property_names()
         for _, row in monthly_df.iterrows():
             month_label = f"{row['Month']} {int(row['Year'])}"
-            avg_value = float(row["avg_rnd"])
+            if avg_col not in row:
+                raise KeyError(f"Expected column '{avg_col}' not found in monthly_df")
+            avg_value = float(row[avg_col])
             
             # Represent the month as a Notion date (first of the month)
             month_number = datetime.strptime(row["Month"], "%B").month
@@ -252,7 +313,7 @@ class Notion:
                 self.client.pages.update(
                     page_id=existing_map[month_label],
                     properties={
-                        "Average rnd": {"number": avg_value},
+                        summary_prop: {"number": avg_value},
                         "Date": {"date": {"start": date_value}},
                     },
                 )
@@ -263,7 +324,7 @@ class Notion:
                     parent={"database_id": db_id},
                     properties={
                         "Name": {"title": [{"text": {"content": month_label}}]},
-                        "Average rnd": {"number": avg_value},
+                        summary_prop: {"number": avg_value},
                         "Date": {"date": {"start": date_value}},
                     },
                 )
@@ -273,37 +334,52 @@ class Notion:
     
     def process_habit_tracking(self, source_db_id, parent_page_id):
         """
-        Complete workflow for processing habit tracking data.
-        
-        This method:
-        1. Fetches daily data from source database
-        2. Converts to DataFrame
-        3. Aggregates monthly performance
-        4. Creates/updates monthly summary database
-        
+        Orchestrates the workflow for processing habit tracking data using single-responsibility methods.
         Args:
             source_db_id (str): Source database ID
             parent_page_id (str): Parent page ID for summary database
-            
         Returns:
             tuple: (daily_df, monthly_df, summary_db_id)
         """
-        # Set database IDs
         self.set_database_ids(source_db_id, parent_page_id=parent_page_id)
-        
-        # Get daily data
+        daily_df = self.fetch_daily_data()
+        monthly_df = self.create_monthly_aggregate(daily_df)
+        summary_db_id = self.manage_monthly_summary_db(monthly_df)
+        return daily_df, monthly_df, summary_db_id
+
+    def fetch_daily_data(self):
+        """
+        Fetches daily habit data from the source database and returns a DataFrame.
+        Returns:
+            pd.DataFrame: Daily habit data
+        """
         print("📊 Fetching daily habit data...")
         daily_df = self.get_daily_data()
         print(f"✅ Fetched {len(daily_df)} daily records")
-        
-        # Aggregate monthly performance
+        return daily_df
+
+    def create_monthly_aggregate(self, daily_df):
+        """
+        Aggregates daily data into monthly averages.
+        Args:
+            daily_df (pd.DataFrame): Daily habit data
+        Returns:
+            pd.DataFrame: Monthly aggregated data
+        """
         print("📈 Aggregating monthly performance...")
         monthly_df = self.aggregate_monthly_performance(daily_df)
         print(f"✅ Created monthly aggregates for {len(monthly_df)} months")
-        
-        # Create/update summary database
+        return monthly_df
+
+    def manage_monthly_summary_db(self, monthly_df):
+        """
+        Creates or updates the monthly summary database with aggregated data.
+        Args:
+            monthly_df (pd.DataFrame): Monthly aggregated data
+        Returns:
+            str: Database ID of the monthly summary database
+        """
         print("🗄️ Managing monthly summary database...")
         summary_db_id = self.get_or_create_monthly_summary_db()
         self.upsert_monthly_summary(summary_db_id, monthly_df)
-        
-        return daily_df, monthly_df, summary_db_id
+        return summary_db_id
